@@ -287,12 +287,15 @@ div[data-testid="stExpander"] {
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 
-# Known 5-minute crypto market prefixes (slug pattern: {PREFIX}-updown-5m-{start_ts})
+# Known 5-minute crypto market prefixes.
+# slug pattern : {prefix}-updown-5m-{start_ts}
+# series_slug  : {prefix}-up-or-down-5m  (used as fallback discovery)
+# Outcomes are "Up" / "Down" (index 0 = Up, index 1 = Down)
 CRYPTO_MARKETS = {
-    "BTC": {"prefix": "btc", "emoji": "₿", "color": "#f59e0b"},
-    "ETH": {"prefix": "eth", "emoji": "Ξ", "color": "#0ea5e9"},
-    "SOL": {"prefix": "sol", "emoji": "◎", "color": "#a78bfa"},
-    "XRP": {"prefix": "xrp", "emoji": "✕", "color": "#00ff88"},
+    "BTC": {"prefix": "btc", "series_slug": "btc-up-or-down-5m", "emoji": "₿", "color": "#f59e0b"},
+    "ETH": {"prefix": "eth", "series_slug": "eth-up-or-down-5m", "emoji": "Ξ", "color": "#0ea5e9"},
+    "SOL": {"prefix": "sol", "series_slug": "sol-up-or-down-5m", "emoji": "◎", "color": "#a78bfa"},
+    "XRP": {"prefix": "xrp", "series_slug": "xrp-up-or-down-5m", "emoji": "✕", "color": "#00ff88"},
 }
 
 PERIOD_SECS = 300  # 5-minute markets
@@ -419,53 +422,150 @@ def _http_get(url: str, params=None, timeout=8, retries=3):
     return None
 
 
+def _parse_market_record(m: dict, slug: str, start_ts: int) -> dict | None:
+    """Parse a raw Gamma market record into the bot's internal format."""
+    outcomes = m.get("outcomes", [])
+    clob_ids = m.get("clobTokenIds", [])
+    if not isinstance(outcomes, list):
+        try:
+            outcomes = json.loads(outcomes)
+        except Exception:
+            return None
+    if not isinstance(clob_ids, list):
+        try:
+            clob_ids = json.loads(clob_ids)
+        except Exception:
+            return None
+
+    if len(clob_ids) < 2:
+        return None
+
+    prices = m.get("outcomePrices", "[]")
+    if not isinstance(prices, list):
+        try:
+            prices = json.loads(prices)
+        except Exception:
+            prices = []
+
+    # Outcomes are "Up"/"Down"; map to yes/no internally for strategy compat
+    return {
+        "slug":       slug,
+        "question":   m.get("question", slug),
+        "up_token":   clob_ids[0],   # "Up" outcome token
+        "down_token": clob_ids[1],   # "Down" outcome token
+        # Alias names used by strategy functions
+        "yes_token":  clob_ids[0],
+        "no_token":   clob_ids[1],
+        "end_date":   m.get("endDate", ""),
+        "active":     m.get("active", False),
+        "closed":     m.get("closed", False),
+        "up_price":   float(prices[0]) if prices else 0.5,
+        "down_price": float(prices[1]) if len(prices) > 1 else 0.5,
+        # Alias names
+        "yes_price":  float(prices[0]) if prices else 0.5,
+        "no_price":   float(prices[1]) if len(prices) > 1 else 0.5,
+        "volume":     float(m.get("volume", 0) or 0),
+        "start_ts":   start_ts,
+    }
+
+
 def fetch_5m_market(prefix: str, start_ts: int) -> dict | None:
-    """Fetch market metadata from Gamma for a specific 5-min market."""
+    """
+    Fetch market metadata for a specific 5-min period.
+    Primary: slug-based lookup.
+    Fallback: series_slug event query (more robust across API changes).
+    """
     slug = get_slug(prefix, start_ts)
     try:
         r = _http_get(f"{GAMMA_API}/markets", params={"slug": slug}, timeout=8)
-        if not r:
-            return None
-        data = r.json()
-        if not data:
-            return None
-        m = data[0] if isinstance(data, list) else data
-
-        outcomes = m.get("outcomes", [])
-        clob_ids = m.get("clobTokenIds", [])
-        if not isinstance(outcomes, list):
-            outcomes = json.loads(outcomes)
-        if not isinstance(clob_ids, list):
-            clob_ids = json.loads(clob_ids)
-
-        if len(outcomes) != 2 or len(clob_ids) != 2:
-            return None
-
-        prices = m.get("outcomePrices", "[]")
-        if not isinstance(prices, list):
-            prices = json.loads(prices)
-
-        return {
-            "slug":       slug,
-            "prefix":     prefix,
-            "question":   m.get("question", slug),
-            "yes_token":  clob_ids[0],
-            "no_token":   clob_ids[1],
-            "end_date":   m.get("endDate", ""),
-            "active":     m.get("active", False),
-            "closed":     m.get("closed", False),
-            "yes_price":  float(prices[0]) if prices else 0.5,
-            "no_price":   float(prices[1]) if len(prices) > 1 else 0.5,
-            "volume":     float(m.get("volume", 0) or 0),
-            "start_ts":   start_ts,
-        }
+        if r:
+            data = r.json()
+            if data:
+                m = data[0] if isinstance(data, list) else data
+                return _parse_market_record(m, slug, start_ts)
     except Exception as e:
-        log(f"[API] fetch market {slug}: {e}", "err")
-        return None
+        log(f"[API] slug lookup {slug}: {e}", "warn")
+
+    # Fallback: query by series_slug to find currently active market
+    series_slug = CRYPTO_MARKETS.get(prefix.upper(), {}).get("series_slug", "")
+    if not series_slug:
+        # Derive series slug from prefix
+        series_slug = f"{prefix}-up-or-down-5m"
+    try:
+        r = _http_get(
+            f"{GAMMA_API}/events",
+            params={
+                "series_slug": series_slug,
+                "closed": "false",
+                "active": "true",
+                "order": "endDate",
+                "ascending": "true",
+                "limit": 1,
+            },
+            timeout=8,
+        )
+        if r:
+            events = r.json()
+            if events:
+                evt = events[0] if isinstance(events, list) else events
+                markets = evt.get("markets", [])
+                if markets:
+                    m = markets[0]
+                    actual_slug = m.get("slug", slug)
+                    # Derive start_ts from the event's start time if available
+                    evt_start = evt.get("eventStartTime") or evt.get("startDate", "")
+                    if evt_start:
+                        from datetime import datetime as _dt
+                        ts_str = evt_start.rstrip("Z").split(".")[0]
+                        try:
+                            dt = _dt.fromisoformat(ts_str)
+                            from datetime import timezone as _tz
+                            actual_start = int(dt.replace(tzinfo=_tz.utc).timestamp())
+                        except Exception:
+                            actual_start = start_ts
+                    else:
+                        actual_start = start_ts
+                    return _parse_market_record(m, actual_slug, actual_start)
+    except Exception as e:
+        log(f"[API] series fallback {series_slug}: {e}", "err")
+
+    return None
+
+
+def fetch_next_5m_market(series_slug: str) -> dict | None:
+    """
+    Find the NEXT upcoming (not yet open) market in a 5-min series.
+    Returns the market with the furthest endDate.
+    """
+    try:
+        r = _http_get(
+            f"{GAMMA_API}/events",
+            params={
+                "series_slug": series_slug,
+                "closed": "false",
+                "order": "endDate",
+                "ascending": "false",
+                "limit": 1,
+            },
+            timeout=8,
+        )
+        if r:
+            events = r.json()
+            if events:
+                evt = events[0] if isinstance(events, list) else events
+                markets = evt.get("markets", [])
+                if markets:
+                    m = markets[0]
+                    slug = m.get("slug", "")
+                    start_ts = get_period_start()
+                    return _parse_market_record(m, slug, start_ts)
+    except Exception as e:
+        log(f"[API] next market {series_slug}: {e}", "err")
+    return None
 
 
 def fetch_orderbook(token_id: str) -> dict | None:
-    """Fetch CLOB order book for a token."""
+    """Fetch CLOB order book for a single token."""
     if not token_id:
         return None
     try:
@@ -479,6 +579,44 @@ def fetch_orderbook(token_id: str) -> dict | None:
     except Exception as e:
         log(f"[API] orderbook {token_id[:12]}…: {e}", "err")
         return None
+
+
+def fetch_orderbooks_batch(token_ids: list[str]) -> dict[str, dict]:
+    """
+    Fetch order books for multiple tokens in a single POST /books call.
+    Falls back to individual GETs if batch fails.
+    Returns {token_id: orderbook_dict}.
+    """
+    if not token_ids:
+        return {}
+    try:
+        r = requests.post(
+            f"{CLOB_API}/books",
+            json=[{"token_id": tid} for tid in token_ids],
+            timeout=10,
+        )
+        if r.ok:
+            data = r.json()
+            # API returns list of {asset_id, bids, asks} objects
+            result = {}
+            for item in (data if isinstance(data, list) else []):
+                tid  = item.get("asset_id", "")
+                asks = item.get("asks", item.get("sells", []))
+                bids = item.get("bids", [])
+                result[tid] = {"asks": asks, "bids": bids}
+            if result:
+                return result
+    except Exception as e:
+        log(f"[API] batch orderbooks failed ({e}), falling back to individual GETs", "warn")
+
+    # Fallback: individual GETs
+    result = {}
+    for tid in token_ids:
+        ob = fetch_orderbook(tid)
+        if ob:
+            result[tid] = ob
+        time.sleep(0.1)
+    return result
 
 
 def best_ask_price(ob: dict | None) -> float | None:
@@ -594,9 +732,8 @@ def check_snipe_strategy(
     if yes_ask is not None and yes_ask > 0:
         edge_yes = 1.0 - yes_ask - fees
         if edge_yes >= p["snipe_threshold"]:
-            yes_bid = best_bid_price(yes_ob) or 0
             candidates.append({
-                "token": "YES", "price": yes_ask,
+                "token": "UP", "price": yes_ask,
                 "edge": edge_yes, "confidence": yes_ask,
             })
 
@@ -604,7 +741,7 @@ def check_snipe_strategy(
         edge_no = 1.0 - no_ask - fees
         if edge_no >= p["snipe_threshold"]:
             candidates.append({
-                "token": "NO", "price": no_ask,
+                "token": "DOWN", "price": no_ask,
                 "edge": edge_no, "confidence": no_ask,
             })
 
@@ -681,7 +818,7 @@ def check_mispriced_strategy(
     """Check both YES and NO books for mispriced orders."""
     opps = []
 
-    for token_label, ob in [("YES", yes_ob), ("NO", no_ob)]:
+    for token_label, ob in [("UP", yes_ob), ("DOWN", no_ob)]:
         if not ob:
             continue
         asks = ob.get("asks", [])
@@ -785,35 +922,49 @@ def refresh_market_data(period_start: int):
         if md:
             st.session_state.market_data[sym] = md
         else:
-            # Market might not exist yet (transition window)
-            if sym in st.session_state.market_data:
+            # Market might not exist yet (transition window) — try series fallback
+            log(f"[DISCOVER] {sym}: slug lookup failed, using series fallback", "warn")
+            md2 = fetch_next_5m_market(info["series_slug"])
+            if md2:
+                st.session_state.market_data[sym] = md2
+            elif sym in st.session_state.market_data:
                 st.session_state.market_data[sym]["closed"] = True
 
-        time.sleep(0.15)  # gentle rate limiting
+        time.sleep(0.15)
 
-    # Fetch order books
-    for sym in CRYPTO_MARKETS:
-        md = st.session_state.market_data.get(sym)
-        if not md:
-            continue
-        yes_ob = fetch_orderbook(md["yes_token"])
-        time.sleep(0.1)
-        no_ob  = fetch_orderbook(md["no_token"])
-        time.sleep(0.1)
-        st.session_state.orderbooks[sym] = {"yes": yes_ob, "no": no_ob}
+    # Fetch all order books in one batch call
+    _refresh_orderbooks_from_market_data()
 
 
-def refresh_orderbooks_only():
-    """Faster refresh — only update order books (not market metadata)."""
+def _refresh_orderbooks_from_market_data():
+    """Collect all token IDs and batch-fetch order books via POST /books."""
+    token_map: dict[str, tuple[str, str]] = {}  # token_id -> (sym, side)
     for sym in CRYPTO_MARKETS:
         md = st.session_state.market_data.get(sym)
         if not md or md.get("closed"):
             continue
-        yes_ob = fetch_orderbook(md["yes_token"])
-        time.sleep(0.1)
-        no_ob  = fetch_orderbook(md["no_token"])
-        time.sleep(0.1)
-        st.session_state.orderbooks[sym] = {"yes": yes_ob, "no": no_ob}
+        token_map[md["up_token"]]   = (sym, "yes")
+        token_map[md["down_token"]] = (sym, "no")
+
+    if not token_map:
+        return
+
+    books = fetch_orderbooks_batch(list(token_map.keys()))
+
+    # Assemble back into per-symbol structure
+    new_obs: dict[str, dict] = {}
+    for tid, (sym, side) in token_map.items():
+        if sym not in new_obs:
+            new_obs[sym] = {}
+        new_obs[sym][side] = books.get(tid)
+
+    for sym, ob in new_obs.items():
+        st.session_state.orderbooks[sym] = ob
+
+
+def refresh_orderbooks_only():
+    """Faster refresh — only update order books (uses batch POST /books)."""
+    _refresh_orderbooks_from_market_data()
 
 
 # ─────────────────────────────────────────────
@@ -1039,9 +1190,9 @@ with st.sidebar:
 
     # ── Strategy Toggles ──
     st.markdown("**🎯 Strategies**")
-    st.session_state["arb_enabled"]       = st.checkbox("1 — Long Arbitrage (YES+NO < 1)", value=True)
+    st.session_state["arb_enabled"]       = st.checkbox("1 — Long Arbitrage (UP+DOWN < 1)", value=True)
     st.session_state["snipe_enabled"]     = st.checkbox("2 — Last-15s Snipe", value=True)
-    st.session_state["mispriced_enabled"] = st.checkbox("3 — Mispriced Orders", value=True)
+    st.session_state["mispriced_enabled"] = st.checkbox("3 — Mispriced Order Snatch", value=True)
 
     st.markdown("---")
 
@@ -1214,17 +1365,26 @@ with tab_monitor:
                 f'<span style="color:#7d8590">{total_disp}</span>'
             )
 
+            # Question snippet from market data
+            question_short = ""
+            if md:
+                q = md.get("question", "")
+                # Extract time range e.g. "11:25AM-11:30AM ET"
+                import re as _re
+                m_q = _re.search(r"\d+:\d+[AP]M-\d+:\d+[AP]M", q)
+                question_short = m_q.group(0) if m_q else q[-30:]
+
             st.markdown(
                 f'<div class="crypto-card {alert_cls}">'
                 f'<div class="crypto-name" style="color:{color}">{info["emoji"]} {sym}</div>'
-                f'<div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.5rem">'
-                f'period {period_dt}→{period_end_dt}</div>'
+                f'<div style="font-size:0.65rem;color:#7d8590;margin-bottom:0.5rem">'
+                f'{question_short or (period_dt + "→" + period_end_dt + " UTC")}</div>'
                 f'<table style="width:100%;font-family:\'JetBrains Mono\';font-size:0.75rem">'
-                f'<tr><td style="color:#7d8590">YES ask</td>'
+                f'<tr><td style="color:#7d8590">UP ask</td>'
                 f'<td style="text-align:right;color:#e6edf3">{yes_price_disp}</td></tr>'
-                f'<tr><td style="color:#7d8590">NO ask</td>'
+                f'<tr><td style="color:#7d8590">DOWN ask</td>'
                 f'<td style="text-align:right;color:#e6edf3">{no_price_disp}</td></tr>'
-                f'<tr><td style="color:#7d8590">Total</td>'
+                f'<tr><td style="color:#7d8590">UP+DOWN</td>'
                 f'<td style="text-align:right">{arb_disp}</td></tr>'
                 f'</table>'
                 f'</div>',
@@ -1232,10 +1392,10 @@ with tab_monitor:
             )
 
             # Order books
-            with st.expander(f"{sym} YES Book", expanded=False):
-                st.markdown(render_orderbook_html(yes_ob, "YES"), unsafe_allow_html=True)
-            with st.expander(f"{sym} NO Book", expanded=False):
-                st.markdown(render_orderbook_html(no_ob, "NO"), unsafe_allow_html=True)
+            with st.expander(f"{sym} UP (Yes) Book", expanded=False):
+                st.markdown(render_orderbook_html(yes_ob, "UP"), unsafe_allow_html=True)
+            with st.expander(f"{sym} DOWN (No) Book", expanded=False):
+                st.markdown(render_orderbook_html(no_ob, "DOWN"), unsafe_allow_html=True)
 
     st.markdown("---")
 
